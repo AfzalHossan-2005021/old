@@ -254,6 +254,10 @@ def coherent_pairwise_align(
             sliceB=procB,
             expr_A_n=expr_A_n,
             expr_B_n=expr_B_n,
+            topo_A=diff_A,
+            topo_B=diff_B,
+            shape_A=shape_A,
+            shape_B=shape_B,
             nbhd_A=nbhd_A,
             nbhd_B=nbhd_B,
             coords_A=coords_A,
@@ -308,6 +312,7 @@ def summarize_alignment_metrics(
 ) -> Dict[str, float]:
     coords_B = np.asarray(sliceB.obsm["spatial"], dtype=np.float64)
     src_warped = np.asarray(result.src_warped, dtype=np.float64)
+    coord_scale = _coordinate_scale(src_warped, coords_B)
 
     pi_fwd = result.pi_fwd.tocsr()
     pi_rev = result.pi_rev.tocsr()
@@ -341,6 +346,7 @@ def summarize_alignment_metrics(
         "unmatched_src_mass_pct": float(result.raw_unmatched_src.sum() * 100.0),
         "unmatched_tgt_mass_pct": float(result.raw_unmatched_tgt.sum() * 100.0),
         "spatial_rmse": spatial_rmse,
+        "spatial_rmse_norm": spatial_rmse / (coord_scale + 1e-12),
         "nsp_pct": nsp,
         "entropy_pct": entropy_pct,
         "eff_targets_per_source": eff_targets,
@@ -351,6 +357,7 @@ def summarize_alignment_metrics(
         "forward_compactness": forward_compactness,
         "reverse_compactness": reverse_compactness,
         "cycle_error": cycle_error,
+        "cycle_error_norm": cycle_error / (coord_scale + 1e-12),
     }
     metrics["selection_score"] = _selection_score(metrics)
     return metrics
@@ -846,6 +853,10 @@ def _refine_hypothesis(
     sliceB: AnnData,
     expr_A_n: ArrayLike,
     expr_B_n: ArrayLike,
+    topo_A: ArrayLike,
+    topo_B: ArrayLike,
+    shape_A: ArrayLike,
+    shape_B: ArrayLike,
     nbhd_A: ArrayLike,
     nbhd_B: ArrayLike,
     coords_A: ArrayLike,
@@ -875,17 +886,41 @@ def _refine_hypothesis(
         reflected=init_transform.reflected,
     )
     deformation: Optional[DeformationField] = None
+    search_desc_A = _row_normalize(np.hstack([topo_A, shape_A, nbhd_A]) + 1e-8)
+    search_desc_B = _row_normalize(np.hstack([topo_B, shape_B, nbhd_B]) + 1e-8)
 
     src_warped = transform.apply(coords_A)
     init_candidate_k = int(max(candidate_k, min(16, 2 * candidate_k)))
-    candidate_fwd = _build_candidate_graph(src_warped, coords_B, labels_A, labels_B, init_candidate_k, type_fallback_A2B)
-    candidate_rev = _build_candidate_graph(coords_B, src_warped, labels_B, labels_A, init_candidate_k, type_fallback_B2A)
+    candidate_fwd = _build_candidate_graph(
+        src_warped,
+        coords_B,
+        labels_A,
+        labels_B,
+        init_candidate_k,
+        type_fallback_A2B,
+        src_desc=search_desc_A,
+        tgt_desc=search_desc_B,
+    )
+    candidate_rev = _build_candidate_graph(
+        coords_B,
+        src_warped,
+        labels_B,
+        labels_A,
+        init_candidate_k,
+        type_fallback_B2A,
+        src_desc=search_desc_B,
+        tgt_desc=search_desc_A,
+    )
 
     fwd_pack = _update_sparse_transport(
         src_coords=src_warped,
         tgt_coords=coords_B,
         expr_src=expr_A_n,
         expr_tgt=expr_B_n,
+        topo_src=topo_A,
+        topo_tgt=topo_B,
+        shape_src=shape_A,
+        shape_tgt=shape_B,
         nbhd_src=nbhd_A,
         nbhd_tgt=nbhd_B,
         labels_src=labels_A,
@@ -906,6 +941,10 @@ def _refine_hypothesis(
         tgt_coords=src_warped,
         expr_src=expr_B_n,
         expr_tgt=expr_A_n,
+        topo_src=topo_B,
+        topo_tgt=topo_A,
+        shape_src=shape_B,
+        shape_tgt=shape_A,
         nbhd_src=nbhd_B,
         nbhd_tgt=nbhd_A,
         labels_src=labels_B,
@@ -951,14 +990,36 @@ def _refine_hypothesis(
                 src_warped = deformation.apply(src_warped)
 
         curr_candidate_k = int(max(candidate_k, round(init_candidate_k - frac * (init_candidate_k - candidate_k))))
-        candidate_fwd = _build_candidate_graph(src_warped, coords_B, labels_A, labels_B, curr_candidate_k, type_fallback_A2B)
-        candidate_rev = _build_candidate_graph(coords_B, src_warped, labels_B, labels_A, curr_candidate_k, type_fallback_B2A)
+        candidate_fwd = _build_candidate_graph(
+            src_warped,
+            coords_B,
+            labels_A,
+            labels_B,
+            curr_candidate_k,
+            type_fallback_A2B,
+            src_desc=search_desc_A,
+            tgt_desc=search_desc_B,
+        )
+        candidate_rev = _build_candidate_graph(
+            coords_B,
+            src_warped,
+            labels_B,
+            labels_A,
+            curr_candidate_k,
+            type_fallback_B2A,
+            src_desc=search_desc_B,
+            tgt_desc=search_desc_A,
+        )
 
         fwd_pack = _update_sparse_transport(
             src_coords=src_warped,
             tgt_coords=coords_B,
             expr_src=expr_A_n,
             expr_tgt=expr_B_n,
+            topo_src=topo_A,
+            topo_tgt=topo_B,
+            shape_src=shape_A,
+            shape_tgt=shape_B,
             nbhd_src=nbhd_A,
             nbhd_tgt=nbhd_B,
             labels_src=labels_A,
@@ -979,6 +1040,10 @@ def _refine_hypothesis(
             tgt_coords=src_warped,
             expr_src=expr_B_n,
             expr_tgt=expr_A_n,
+            topo_src=topo_B,
+            topo_tgt=topo_A,
+            shape_src=shape_B,
+            shape_tgt=shape_A,
             nbhd_src=nbhd_B,
             nbhd_tgt=nbhd_A,
             labels_src=labels_B,
@@ -1021,10 +1086,14 @@ def _build_candidate_graph(
     tgt_labels: ArrayLike,
     candidate_k: int,
     fallback_map: Dict[str, Optional[str]],
+    src_desc: Optional[ArrayLike] = None,
+    tgt_desc: Optional[ArrayLike] = None,
 ) -> list[ArrayLike]:
     candidate_graph: list[ArrayLike] = [np.empty(0, dtype=np.int64) for _ in range(src_coords.shape[0])]
     type_to_indices: Dict[str, ArrayLike] = {}
     type_to_nn: Dict[str, NearestNeighbors] = {}
+    type_to_desc_nn: Dict[str, NearestNeighbors] = {}
+    use_desc = src_desc is not None and tgt_desc is not None
 
     for label in np.unique(tgt_labels):
         idx = np.where(tgt_labels == label)[0]
@@ -1035,6 +1104,11 @@ def _build_candidate_graph(
         nn = NearestNeighbors(n_neighbors=n_neighbors)
         nn.fit(tgt_coords[idx])
         type_to_nn[label] = nn
+        if use_desc:
+            desc_k = int(max(1, min(candidate_k, idx.size)))
+            desc_nn = NearestNeighbors(n_neighbors=desc_k)
+            desc_nn.fit(tgt_desc[idx])
+            type_to_desc_nn[label] = desc_nn
 
     for label in np.unique(src_labels):
         src_idx = np.where(src_labels == label)[0]
@@ -1045,8 +1119,16 @@ def _build_candidate_graph(
         nn = type_to_nn[target_label]
         _, local = nn.kneighbors(src_coords[src_idx], n_neighbors=nn.n_neighbors)
         mapped = target_idx[local]
+        mapped_desc = None
+        if use_desc and target_label in type_to_desc_nn:
+            desc_nn = type_to_desc_nn[target_label]
+            _, local_desc = desc_nn.kneighbors(src_desc[src_idx], n_neighbors=desc_nn.n_neighbors)
+            mapped_desc = target_idx[local_desc]
         for local_pos, global_pos in enumerate(src_idx):
-            candidate_graph[global_pos] = mapped[local_pos].astype(np.int64)
+            ordered = mapped[local_pos].tolist()
+            if mapped_desc is not None:
+                ordered.extend(mapped_desc[local_pos].tolist())
+            candidate_graph[global_pos] = np.asarray(list(dict.fromkeys(int(v) for v in ordered)), dtype=np.int64)
     return candidate_graph
 
 
@@ -1055,6 +1137,10 @@ def _update_sparse_transport(
     tgt_coords: ArrayLike,
     expr_src: ArrayLike,
     expr_tgt: ArrayLike,
+    topo_src: ArrayLike,
+    topo_tgt: ArrayLike,
+    shape_src: ArrayLike,
+    shape_tgt: ArrayLike,
     nbhd_src: ArrayLike,
     nbhd_tgt: ArrayLike,
     labels_src: ArrayLike,
@@ -1092,11 +1178,13 @@ def _update_sparse_transport(
             continue
 
         gene = _candidate_gene_cost(expr_src[i], expr_tgt[cands])
+        topo = _candidate_gene_cost(topo_src[i], topo_tgt[cands])
+        shape = _candidate_gene_cost(shape_src[i], shape_tgt[cands])
         niche = _jsd_to_candidates(nbhd_src[i], nbhd_tgt[cands])
         spatial = np.linalg.norm(tgt_coords[cands] - src_coords[i], axis=1) / (spatial_scale + 1e-12)
         spatial = np.clip(spatial, 0.0, 4.0) / 4.0
         type_penalty = 4.0 * (labels_tgt[cands] != labels_src[i]).astype(np.float64)
-        feature_cost = gene + niche + spatial + type_penalty
+        feature_cost = np.mean(np.vstack([gene, topo, shape, niche, spatial]), axis=0) + type_penalty
 
         compact_cost = np.zeros_like(feature_cost)
         smooth_cost = np.zeros_like(feature_cost)
@@ -1129,14 +1217,14 @@ def _update_sparse_transport(
         if reverse_spread is not None:
             reverse_compact_cost = np.clip(reverse_spread[cands] / (spatial_scale + 1e-12), 0.0, 4.0) / 4.0
 
-        total_cost = feature_cost + lambda_dynamic * (
-            compact_cost + smooth_cost + isometry_cost + cycle_cost + reverse_compact_cost
+        dynamic_cost = np.mean(
+            np.vstack([compact_cost, smooth_cost, isometry_cost, cycle_cost, reverse_compact_cost]),
+            axis=0,
         )
-        unmatched_cost = 0.35 + 0.85 * unmatched_confidence[i]
-        probs = _softmax_neg(np.concatenate([total_cost, [unmatched_cost]]), temperature)
-
-        unmatched_prob = float(probs[-1])
-        match_probs = probs[:-1]
+        total_cost = feature_cost + lambda_dynamic * dynamic_cost
+        unmatched_cost = 0.75 + 0.55 * unmatched_confidence[i]
+        raw_match_probs = _softmax_neg(total_cost, temperature)
+        match_probs = raw_match_probs.copy()
         if sharpen and match_probs.size > 0:
             keep = np.argsort(-match_probs)[: min(2, match_probs.size)]
             sharpened = np.zeros_like(match_probs)
@@ -1150,14 +1238,18 @@ def _update_sparse_transport(
             if denom > 0:
                 match_probs = sharpened / denom
 
-        matched_mass = src_mass_unit * (1.0 - unmatched_prob)
-        row_mass[i] = matched_mass
-        unmatched_mass[i] = src_mass_unit - matched_mass
-        if match_probs.size > 0:
-            order = np.sort(match_probs)
+        if raw_match_probs.size > 0:
+            order = np.sort(raw_match_probs)
             top1 = float(order[-1])
             top2 = float(order[-2]) if order.size > 1 else 0.0
             confidence[i] = top1 / (top1 + top2 + 1e-12)
+
+        match_energy = _softmin(total_cost, temperature)
+        quality = _sigmoid((unmatched_cost - match_energy) / max(0.08, 0.75 * temperature))
+        matched_frac = quality * (0.5 + 0.5 * confidence[i])
+        matched_mass = src_mass_unit * matched_frac
+        row_mass[i] = matched_mass
+        unmatched_mass[i] = src_mass_unit - matched_mass
 
         if matched_mass <= 0:
             bary[i] = src_coords[i]
@@ -1228,7 +1320,8 @@ def _jsd_to_candidates(src_row: ArrayLike, tgt_rows: ArrayLike) -> ArrayLike:
     m = 0.5 * (q + p[None, :])
     kl_pm = np.sum(p[None, :] * np.log((p[None, :] + 1e-12) / (m + 1e-12)), axis=1)
     kl_qm = np.sum(q * np.log((q + 1e-12) / (m + 1e-12)), axis=1)
-    return np.sqrt(0.5 * (kl_pm + kl_qm))
+    jsd = np.clip(0.5 * (kl_pm + kl_qm), 0.0, None)
+    return np.sqrt(jsd)
 
 
 def _softmax_neg(costs: ArrayLike, temperature: float) -> ArrayLike:
@@ -1236,6 +1329,22 @@ def _softmax_neg(costs: ArrayLike, temperature: float) -> ArrayLike:
     scaled = scaled - np.max(scaled)
     expv = np.exp(scaled)
     return expv / (expv.sum() + 1e-12)
+
+
+def _softmin(costs: ArrayLike, temperature: float) -> float:
+    values = np.asarray(costs, dtype=np.float64)
+    if values.size == 0:
+        return float("inf")
+    temp = max(float(temperature), 1e-3)
+    scaled = -values / temp
+    max_scaled = float(np.max(scaled))
+    lse = max_scaled + np.log(np.sum(np.exp(scaled - max_scaled)) + 1e-12)
+    return float(-temp * lse)
+
+
+def _sigmoid(value: Union[float, ArrayLike]) -> Union[float, ArrayLike]:
+    clipped = np.clip(value, -40.0, 40.0)
+    return 1.0 / (1.0 + np.exp(-clipped))
 
 
 def _sparse_type_match(pi: sp.csr_matrix, src_types: ArrayLike, tgt_types: ArrayLike) -> float:
@@ -1306,6 +1415,15 @@ def _safe_weighted_rmse(src: ArrayLike, tgt: ArrayLike, weights: ArrayLike) -> f
         return float("nan")
     residual = np.linalg.norm(src - tgt, axis=1)
     return float(np.sqrt(np.average(residual ** 2, weights=weights + 1e-12)))
+
+
+def _coordinate_scale(src: ArrayLike, tgt: ArrayLike) -> float:
+    pts = np.vstack([np.asarray(src, dtype=np.float64), np.asarray(tgt, dtype=np.float64)])
+    if pts.shape[0] < 2:
+        return 1.0
+    span = pts.max(axis=0) - pts.min(axis=0)
+    scale = float(np.linalg.norm(span))
+    return scale if np.isfinite(scale) and scale > 0 else 1.0
 
 
 def _nsp_score(src_warped: ArrayLike, tgt_coords: ArrayLike, best_targets: ArrayLike, valid_best: ArrayLike, k_nn: int) -> float:
@@ -1394,20 +1512,22 @@ def _selection_score(metrics: Dict[str, float]) -> float:
     def safe(value: float, fallback: float) -> float:
         return float(value) if np.isfinite(value) else fallback
 
+    matched_frac = metrics["matched_mass_pct"] / 100.0
     penalty = 0.0
     penalty += 0.4 * (100.0 - metrics["cell_type_match_pct"]) / 100.0
-    penalty += 0.8 * safe(metrics["spatial_rmse"], 2.0)
+    penalty += 0.9 * safe(metrics.get("spatial_rmse_norm", metrics["spatial_rmse"]), 2.0)
     penalty += 0.8 * (100.0 - safe(metrics["nsp_pct"], 0.0)) / 100.0
     penalty += 0.6 * metrics["symmetry_ambiguity"]
     penalty += 0.6 * safe(metrics["forward_compactness"], 1.0)
     penalty += 0.6 * safe(metrics["reverse_compactness"], 1.0)
-    penalty += 0.6 * safe(metrics["cycle_error"], 1.0)
+    penalty += 0.6 * safe(metrics.get("cycle_error_norm", metrics["cycle_error"]), 1.0)
     penalty += 0.8 * safe(metrics["mapped_geom_stress"], 1.0)
     penalty += 0.2 * metrics["eff_targets_per_source"]
     penalty += 0.2 * metrics["eff_sources_per_target"]
     penalty += 0.5 * metrics["unmatched_src_mass_pct"] / 100.0
-    penalty += 0.3 * metrics["unmatched_tgt_mass_pct"] / 100.0
-    penalty += 0.25 * max(0.0, 0.75 - metrics["matched_mass_pct"] / 100.0)
+    penalty += 0.7 * metrics["unmatched_tgt_mass_pct"] / 100.0
+    penalty += 1.4 * (1.0 - matched_frac)
+    penalty += 1.0 * max(0.0, 0.35 - matched_frac)
     return float(penalty)
 
 
