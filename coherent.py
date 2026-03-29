@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from itertools import combinations
-from typing import Any, Dict, Iterable, Literal, Optional
+from typing import Any, Dict, Iterable, List, Literal, Optional, Union
 
 import numpy as np
 import scipy.sparse as sp
@@ -59,6 +59,119 @@ class AlignmentResult:
     forward_barycenters: ArrayLike
     reverse_barycenters: ArrayLike
     metrics: Dict[str, float]
+
+
+def generalized_procrustes_analysis(
+    X: np.ndarray,
+    Y: np.ndarray,
+    pi: Union[np.ndarray, sp.spmatrix],
+    output_params: bool = False,
+    matrix: bool = False,
+    min_mass_threshold: float = 0.05,
+    allow_reflection: bool = False,
+) -> tuple:
+    assert X.shape[1] == 2 and Y.shape[1] == 2
+    pi_arr = pi.toarray() if sp.issparse(pi) else np.asarray(pi, dtype=np.float64)
+    pi_mass = float(pi_arr.sum())
+    if pi_mass <= 0:
+        raise ValueError("Transport plan mass is zero; cannot align.")
+
+    row_mass = pi_arr.sum(axis=1)
+    col_mass = pi_arr.sum(axis=0)
+    mean_row = row_mass.mean() + 1e-12
+    mean_col = col_mass.mean() + 1e-12
+
+    w_X = np.clip(row_mass / mean_row, min_mass_threshold, None)
+    w_Y = np.clip(col_mass / mean_col, min_mass_threshold, None)
+    w_X /= w_X.sum() + 1e-12
+    w_Y /= w_Y.sum() + 1e-12
+
+    tX = w_X @ X
+    tY = w_Y @ Y
+    X_c = X - tX
+    Y_c = Y - tY
+
+    H = Y_c.T @ ((pi_arr / pi_mass).T @ X_c)
+    U, _, Vt = np.linalg.svd(H, full_matrices=False)
+
+    R = Vt.T @ U.T
+    if not allow_reflection and np.linalg.det(R) < 0:
+        Vt[-1, :] *= -1.0
+        R = Vt.T @ U.T
+
+    X_aligned = (R @ X_c.T).T + tY
+    Y_aligned = Y_c + tY
+
+    if not output_params:
+        return X_aligned, Y_aligned
+
+    if matrix:
+        return X_aligned, Y_aligned, R, tX, tY
+    theta = np.arctan2(R[1, 0], R[0, 0])
+    return X_aligned, Y_aligned, theta, tX, tY
+
+
+def stack_slices_pairwise(
+    slices: List[AnnData],
+    alignment: List[Union[np.ndarray, sp.spmatrix, AlignmentResult]],
+    output_params: bool = False,
+    matrix: bool = False,
+) -> Union[List[AnnData], tuple]:
+    assert len(slices) == len(alignment) + 1 and len(slices) > 1
+
+    if len(alignment) == 1 and isinstance(alignment[0], AlignmentResult):
+        result = alignment[0]
+        s1 = slices[0].copy()
+        s2 = slices[1].copy()
+        s1.obsm["spatial"] = np.asarray(result.src_warped, dtype=np.float64)
+        s2.obsm["spatial"] = np.asarray(result.tgt_warped, dtype=np.float64)
+        return [s1, s2]
+
+    new_coor, thetas, translations = [], [], []
+    first = alignment[0]
+    if output_params:
+        S1, S2, theta, tX, tY = generalized_procrustes_analysis(
+            slices[0].obsm["spatial"],
+            slices[1].obsm["spatial"],
+            first,
+            output_params=True,
+            matrix=matrix,
+        )
+        thetas.append(theta)
+        translations.extend([tX, tY])
+    else:
+        S1, S2 = generalized_procrustes_analysis(
+            slices[0].obsm["spatial"],
+            slices[1].obsm["spatial"],
+            first,
+        )
+    new_coor.extend([S1, S2])
+
+    for i in range(1, len(slices) - 1):
+        curr = alignment[i]
+        if output_params:
+            _, y, theta, tX, tY = generalized_procrustes_analysis(
+                new_coor[i],
+                slices[i + 1].obsm["spatial"],
+                curr,
+                output_params=True,
+                matrix=matrix,
+            )
+            thetas.append(theta)
+            translations.append(tY)
+        else:
+            _, y = generalized_procrustes_analysis(new_coor[i], slices[i + 1].obsm["spatial"], curr)
+        new_coor.append(y)
+
+    new_slices = []
+    for i, s in enumerate(slices):
+        sc = s.copy()
+        sc.obsm["spatial"] = new_coor[i]
+        new_slices.append(sc)
+
+    if output_params:
+        return new_slices, thetas, translations
+    return new_slices
 
 
 def coherent_pairwise_align(
@@ -241,6 +354,122 @@ def summarize_alignment_metrics(
     }
     metrics["selection_score"] = _selection_score(metrics)
     return metrics
+
+
+def visualize_alignment_unbalanced(
+    sliceA: AnnData,
+    sliceB: AnnData,
+    alignment: Union[np.ndarray, sp.spmatrix, AlignmentResult],
+    n_arrows: int = 1000,
+    links_per_source: int = 2,
+    min_link_ratio: float = 0.35,
+    figsize: tuple = (20, 6),
+    title: str = "Coherent Partial Registration",
+) -> List[AnnData]:
+    import matplotlib.pyplot as plt
+
+    if isinstance(alignment, AlignmentResult):
+        result = alignment
+        new_slices = stack_slices_pairwise([sliceA, sliceB], [result])
+        pi12 = result.pi_fwd.tocsr()
+        s1 = np.asarray(result.src_warped, dtype=np.float64)
+        s2 = np.asarray(result.tgt_warped, dtype=np.float64)
+        bary = np.asarray(result.forward_barycenters, dtype=np.float64)
+        reverse_bary = np.asarray(result.reverse_barycenters, dtype=np.float64)
+    else:
+        pi12 = alignment if sp.issparse(alignment) else sp.csr_matrix(np.asarray(alignment, dtype=np.float64))
+        new_slices = stack_slices_pairwise([sliceA, sliceB], [pi12])
+        s1 = np.asarray(new_slices[0].obsm["spatial"], dtype=np.float64)
+        s2 = np.asarray(new_slices[1].obsm["spatial"], dtype=np.float64)
+        bary = _dense_barycenters(pi12, s2, fallback=s1)
+        reverse_bary = _dense_barycenters(pi12.T.tocsr(), s1, fallback=s2)
+
+    row_mass = np.asarray(pi12.sum(axis=1)).ravel()
+    p_A = np.full(pi12.shape[0], 1.0 / max(pi12.shape[0], 1), dtype=np.float64)
+    match_conf = np.clip(row_mass / (p_A + 1e-12), 0.0, 1.0)
+    D_local = np.clip(p_A - row_mass, 0.0, None)
+    D_local_norm = D_local / (D_local.max() + 1e-12)
+    compact_local = _row_transport_spread(pi12, s2, bary)
+    compact_local_norm = compact_local / (np.nanmax(compact_local) + 1e-12)
+    cycle_local = _row_cycle_error(pi12, reverse_bary, s1)
+    cycle_local_norm = cycle_local / (np.nanmax(cycle_local) + 1e-12)
+
+    fig, axes = plt.subplots(1, 4, figsize=figsize)
+    fig.patch.set_facecolor("#1a1a2e")
+    for ax in axes:
+        ax.set_facecolor("#16213e")
+
+    ax = axes[0]
+    sc1 = ax.scatter(s1[:, 0], s1[:, 1], s=2, c=match_conf, cmap="RdYlGn", vmin=0, vmax=1, alpha=0.9)
+    ax.scatter(s2[:, 0], s2[:, 1], s=2, c="#60a5fa", alpha=0.35)
+    cbar = plt.colorbar(sc1, ax=ax, shrink=0.6)
+    cbar.set_label("Match confidence", color="white")
+    cbar.ax.yaxis.set_tick_params(color="white")
+    ax.set_title("Aligned slices", color="white", fontsize=11)
+    ax.axis("off")
+
+    ax = axes[1]
+    sc2 = ax.scatter(s1[:, 0], s1[:, 1], s=2, c=D_local_norm, cmap="hot_r", alpha=0.9)
+    cbar2 = plt.colorbar(sc2, ax=ax, shrink=0.6)
+    cbar2.set_label("Unmatched mass", color="white")
+    cbar2.ax.yaxis.set_tick_params(color="white")
+    ax.set_title("Source unmatched mass", color="white", fontsize=11)
+    ax.axis("off")
+
+    ax = axes[2]
+    sc3 = ax.scatter(s1[:, 0], s1[:, 1], s=2, c=compact_local_norm, cmap="viridis", alpha=0.9)
+    ax.scatter(bary[:, 0], bary[:, 1], s=1, c="#fbbf24", alpha=0.18)
+    cbar3 = plt.colorbar(sc3, ax=ax, shrink=0.6)
+    cbar3.set_label("Local transport spread", color="white")
+    cbar3.ax.yaxis.set_tick_params(color="white")
+    ax.set_title("Compactness diagnostic", color="white", fontsize=11)
+    ax.axis("off")
+
+    ax = axes[3]
+    ax.scatter(s1[:, 0], s1[:, 1], s=1, c="#f87171", alpha=0.28, label="Source")
+    ax.scatter(s2[:, 0], s2[:, 1], s=1, c="#60a5fa", alpha=0.28, label="Target")
+    src_idx, tgt_idx = _sample_transport_links(pi12, n_arrows=n_arrows, links_per_source=links_per_source, min_link_ratio=min_link_ratio)
+    max_pi = float(pi12.data.max()) + 1e-12 if pi12.nnz > 0 else 1.0
+    for si, ti in zip(src_idx, tgt_idx):
+        alpha_val = (float(pi12[si, ti]) / max_pi) * 0.55 + 0.1
+        ax.plot([s1[si, 0], s2[ti, 0]], [s1[si, 1], s2[ti, 1]], color="#fbbf24", alpha=alpha_val, linewidth=0.4)
+    if cycle_local_norm.size and np.nanmax(cycle_local_norm) > 0:
+        hi_cycle = np.where(cycle_local_norm >= np.nanquantile(cycle_local_norm, 0.8))[0]
+    else:
+        hi_cycle = np.array([], dtype=int)
+    if hi_cycle.size > 0:
+        ax.scatter(s1[hi_cycle, 0], s1[hi_cycle, 1], s=3, c=cycle_local_norm[hi_cycle], cmap="magma", alpha=0.9, label="High cycle error")
+    ax.legend(markerscale=5, fontsize=8, facecolor="#16213e", labelcolor="white", framealpha=0.6)
+    ax.set_title("Sparse links + cycle hotspots", color="white", fontsize=11)
+    ax.axis("off")
+
+    plt.suptitle(title, color="white", fontsize=14, y=1.01)
+    plt.tight_layout()
+    plt.show()
+    return new_slices
+
+
+def visualize_alignment(
+    sliceA: AnnData,
+    sliceB: AnnData,
+    alignment: Union[np.ndarray, sp.spmatrix, AlignmentResult],
+    title: str = "Alignment overview",
+) -> List[AnnData]:
+    import matplotlib.pyplot as plt
+
+    new_slices = stack_slices_pairwise([sliceA, sliceB], [alignment])
+    s1 = np.asarray(new_slices[0].obsm["spatial"], dtype=np.float64)
+    s2 = np.asarray(new_slices[1].obsm["spatial"], dtype=np.float64)
+
+    plt.figure(figsize=(8, 6))
+    plt.scatter(s1[:, 0], s1[:, 1], s=1, alpha=0.5, c="#e41a1c", label="Source")
+    plt.scatter(s2[:, 0], s2[:, 1], s=1, alpha=0.5, c="#377eb8", label="Target")
+    plt.axis("off")
+    plt.legend(markerscale=5)
+    plt.title(title)
+    plt.tight_layout()
+    plt.show()
+    return new_slices
 
 
 def _prepare_slices(sliceA: AnnData, sliceB: AnnData) -> tuple[AnnData, AnnData]:
@@ -648,8 +877,9 @@ def _refine_hypothesis(
     deformation: Optional[DeformationField] = None
 
     src_warped = transform.apply(coords_A)
-    candidate_fwd = _build_candidate_graph(src_warped, coords_B, labels_A, labels_B, candidate_k, type_fallback_A2B)
-    candidate_rev = _build_candidate_graph(coords_B, src_warped, labels_B, labels_A, candidate_k, type_fallback_B2A)
+    init_candidate_k = int(max(candidate_k, min(16, 2 * candidate_k)))
+    candidate_fwd = _build_candidate_graph(src_warped, coords_B, labels_A, labels_B, init_candidate_k, type_fallback_A2B)
+    candidate_rev = _build_candidate_graph(coords_B, src_warped, labels_B, labels_A, init_candidate_k, type_fallback_B2A)
 
     fwd_pack = _update_sparse_transport(
         src_coords=src_warped,
@@ -669,6 +899,7 @@ def _refine_hypothesis(
         spatial_scale=spatial_scale,
         lambda_dynamic=0.0,
         sharpen=False,
+        reverse_spread=None,
     )
     rev_pack = _update_sparse_transport(
         src_coords=coords_B,
@@ -688,6 +919,7 @@ def _refine_hypothesis(
         spatial_scale=spatial_scale,
         lambda_dynamic=0.0,
         sharpen=False,
+        reverse_spread=None,
     )
 
     for iter_idx in range(n_iters):
@@ -699,10 +931,16 @@ def _refine_hypothesis(
 
         positive = fwd_pack["row_mass"] > 0
         if np.any(positive):
+            conf = fwd_pack["confidence"][positive]
+            conf_thr = np.quantile(conf, 0.4) if conf.size > 3 else 0.0
+            fit_mask = positive.copy()
+            fit_mask[positive] = conf >= conf_thr
+            if fit_mask.sum() < 8:
+                fit_mask = positive
             transform = _fit_weighted_transform(
-                coords_A[positive],
-                fwd_pack["barycenters"][positive],
-                np.maximum(fwd_pack["row_mass"][positive], 1e-12),
+                coords_A[fit_mask],
+                fwd_pack["barycenters"][fit_mask],
+                np.maximum(fwd_pack["row_mass"][fit_mask] * (0.5 + fwd_pack["confidence"][fit_mask]), 1e-12),
                 allow_reflection=True,
             )
         src_warped = transform.apply(coords_A)
@@ -712,8 +950,9 @@ def _refine_hypothesis(
             if deformation is not None:
                 src_warped = deformation.apply(src_warped)
 
-        candidate_fwd = _build_candidate_graph(src_warped, coords_B, labels_A, labels_B, candidate_k, type_fallback_A2B)
-        candidate_rev = _build_candidate_graph(coords_B, src_warped, labels_B, labels_A, candidate_k, type_fallback_B2A)
+        curr_candidate_k = int(max(candidate_k, round(init_candidate_k - frac * (init_candidate_k - candidate_k))))
+        candidate_fwd = _build_candidate_graph(src_warped, coords_B, labels_A, labels_B, curr_candidate_k, type_fallback_A2B)
+        candidate_rev = _build_candidate_graph(coords_B, src_warped, labels_B, labels_A, curr_candidate_k, type_fallback_B2A)
 
         fwd_pack = _update_sparse_transport(
             src_coords=src_warped,
@@ -733,6 +972,7 @@ def _refine_hypothesis(
             spatial_scale=spatial_scale,
             lambda_dynamic=lambda_dynamic,
             sharpen=iter_idx == n_iters - 1,
+            reverse_spread=rev_pack["support_spread"],
         )
         rev_pack = _update_sparse_transport(
             src_coords=coords_B,
@@ -752,6 +992,7 @@ def _refine_hypothesis(
             spatial_scale=spatial_scale,
             lambda_dynamic=lambda_dynamic,
             sharpen=iter_idx == n_iters - 1,
+            reverse_spread=fwd_pack["support_spread"],
         )
 
     result = AlignmentResult(
@@ -827,6 +1068,7 @@ def _update_sparse_transport(
     spatial_scale: float,
     lambda_dynamic: float,
     sharpen: bool,
+    reverse_spread: Optional[ArrayLike],
 ) -> Dict[str, Any]:
     n_src = src_coords.shape[0]
     n_tgt = tgt_coords.shape[0]
@@ -836,6 +1078,8 @@ def _update_sparse_transport(
     bary = np.zeros_like(src_coords)
     row_mass = np.zeros(n_src, dtype=np.float64)
     unmatched_mass = np.zeros(n_src, dtype=np.float64)
+    support_spread = np.zeros(n_src, dtype=np.float64)
+    confidence = np.zeros(n_src, dtype=np.float64)
 
     neighbor_lists = neighbor_idx[:, : min(8, neighbor_idx.shape[1])] if neighbor_idx.ndim == 2 else neighbor_idx
     src_mass_unit = 1.0 / max(n_src, 1)
@@ -858,6 +1102,7 @@ def _update_sparse_transport(
         smooth_cost = np.zeros_like(feature_cost)
         isometry_cost = np.zeros_like(feature_cost)
         cycle_cost = np.zeros_like(feature_cost)
+        reverse_compact_cost = np.zeros_like(feature_cost)
 
         if prev_bary is not None:
             compact_cost = np.linalg.norm(tgt_coords[cands] - prev_bary[i], axis=1) / (spatial_scale + 1e-12)
@@ -873,13 +1118,20 @@ def _update_sparse_transport(
 
                 src_edge = np.linalg.norm(nbr_src - src_coords[i], axis=1) / (spatial_scale + 1e-12)
                 tgt_edge = cdist(tgt_coords[cands], nbr_bary) / (spatial_scale + 1e-12)
-                isometry_cost = np.mean(np.abs(tgt_edge - src_edge[None, :]), axis=1)
+                edge_delta = tgt_edge - src_edge[None, :]
+                huber = np.where(np.abs(edge_delta) <= 0.5, 0.5 * edge_delta ** 2, 0.5 * (np.abs(edge_delta) - 0.25))
+                isometry_cost = np.mean(huber, axis=1)
 
         if reverse_bary is not None:
             cycle = np.linalg.norm(reverse_bary[cands] - src_coords[i], axis=1) / (spatial_scale + 1e-12)
             cycle_cost = np.clip(cycle, 0.0, 4.0) / 4.0
 
-        total_cost = feature_cost + lambda_dynamic * (compact_cost + smooth_cost + isometry_cost + cycle_cost)
+        if reverse_spread is not None:
+            reverse_compact_cost = np.clip(reverse_spread[cands] / (spatial_scale + 1e-12), 0.0, 4.0) / 4.0
+
+        total_cost = feature_cost + lambda_dynamic * (
+            compact_cost + smooth_cost + isometry_cost + cycle_cost + reverse_compact_cost
+        )
         unmatched_cost = 0.35 + 0.85 * unmatched_confidence[i]
         probs = _softmax_neg(np.concatenate([total_cost, [unmatched_cost]]), temperature)
 
@@ -888,7 +1140,12 @@ def _update_sparse_transport(
         if sharpen and match_probs.size > 0:
             keep = np.argsort(-match_probs)[: min(2, match_probs.size)]
             sharpened = np.zeros_like(match_probs)
-            sharpened[keep] = match_probs[keep] ** 2
+            top_keep = match_probs[keep]
+            rel = top_keep / (top_keep.max() + 1e-12)
+            active_keep = keep[rel >= 0.25]
+            if active_keep.size == 0:
+                active_keep = keep[:1]
+            sharpened[active_keep] = match_probs[active_keep] ** 2.5
             denom = sharpened.sum()
             if denom > 0:
                 match_probs = sharpened / denom
@@ -896,6 +1153,11 @@ def _update_sparse_transport(
         matched_mass = src_mass_unit * (1.0 - unmatched_prob)
         row_mass[i] = matched_mass
         unmatched_mass[i] = src_mass_unit - matched_mass
+        if match_probs.size > 0:
+            order = np.sort(match_probs)
+            top1 = float(order[-1])
+            top2 = float(order[-2]) if order.size > 1 else 0.0
+            confidence[i] = top1 / (top1 + top2 + 1e-12)
 
         if matched_mass <= 0:
             bary[i] = src_coords[i]
@@ -903,6 +1165,7 @@ def _update_sparse_transport(
 
         weights = match_probs / (match_probs.sum() + 1e-12)
         bary[i] = weights @ tgt_coords[cands]
+        support_spread[i] = float(np.sqrt(np.sum(weights * np.sum((tgt_coords[cands] - bary[i]) ** 2, axis=1))))
         active = np.where(weights > 1e-4)[0]
         if active.size == 0:
             active = np.array([int(np.argmax(weights))])
@@ -917,6 +1180,8 @@ def _update_sparse_transport(
         "barycenters": bary,
         "row_mass": row_mass,
         "unmatched_mass": unmatched_mass,
+        "support_spread": support_spread,
+        "confidence": confidence,
     }
 
 
@@ -1141,4 +1406,88 @@ def _selection_score(metrics: Dict[str, float]) -> float:
     penalty += 0.2 * metrics["eff_targets_per_source"]
     penalty += 0.2 * metrics["eff_sources_per_target"]
     penalty += 0.5 * metrics["unmatched_src_mass_pct"] / 100.0
+    penalty += 0.3 * metrics["unmatched_tgt_mass_pct"] / 100.0
+    penalty += 0.25 * max(0.0, 0.75 - metrics["matched_mass_pct"] / 100.0)
     return float(penalty)
+
+
+def _dense_barycenters(pi: sp.csr_matrix, target_coords: ArrayLike, fallback: ArrayLike) -> ArrayLike:
+    bary = np.asarray(fallback, dtype=np.float64).copy()
+    for i in range(pi.shape[0]):
+        start, end = pi.indptr[i], pi.indptr[i + 1]
+        cols = pi.indices[start:end]
+        vals = pi.data[start:end]
+        mass = float(vals.sum())
+        if cols.size == 0 or mass <= 0:
+            continue
+        bary[i] = (vals[:, None] * target_coords[cols]).sum(axis=0) / (mass + 1e-12)
+    return bary
+
+
+def _row_transport_spread(pi: sp.csr_matrix, target_coords: ArrayLike, bary: ArrayLike) -> ArrayLike:
+    out = np.zeros(pi.shape[0], dtype=np.float64)
+    for i in range(pi.shape[0]):
+        start, end = pi.indptr[i], pi.indptr[i + 1]
+        cols = pi.indices[start:end]
+        vals = pi.data[start:end]
+        mass = float(vals.sum())
+        if cols.size == 0 or mass <= 0:
+            out[i] = 0.0
+            continue
+        sq = np.sum((target_coords[cols] - bary[i]) ** 2, axis=1)
+        out[i] = float(np.sqrt(np.sum(vals * sq) / (mass + 1e-12)))
+    return out
+
+
+def _row_cycle_error(pi: sp.csr_matrix, reverse_bary: ArrayLike, src_coords: ArrayLike) -> ArrayLike:
+    out = np.zeros(pi.shape[0], dtype=np.float64)
+    for i in range(pi.shape[0]):
+        start, end = pi.indptr[i], pi.indptr[i + 1]
+        cols = pi.indices[start:end]
+        vals = pi.data[start:end]
+        mass = float(vals.sum())
+        if cols.size == 0 or mass <= 0:
+            out[i] = 0.0
+            continue
+        cyc = (vals[:, None] * reverse_bary[cols]).sum(axis=0) / (mass + 1e-12)
+        out[i] = float(np.linalg.norm(cyc - src_coords[i]))
+    return out
+
+
+def _sample_transport_links(
+    pi: sp.csr_matrix,
+    n_arrows: int = 300,
+    links_per_source: int = 2,
+    min_link_ratio: float = 0.35,
+) -> tuple[np.ndarray, np.ndarray]:
+    candidate_src: list[int] = []
+    candidate_tgt: list[int] = []
+    candidate_mass: list[float] = []
+    k_src = int(max(1, links_per_source))
+    ratio = float(np.clip(min_link_ratio, 0.0, 1.0))
+
+    for si in range(pi.shape[0]):
+        start, end = pi.indptr[si], pi.indptr[si + 1]
+        cols = pi.indices[start:end]
+        vals = pi.data[start:end]
+        if vals.size == 0:
+            continue
+        order = np.argsort(vals)
+        top_idx = order[-min(k_src, vals.size):]
+        thr = ratio * (float(vals.max()) + 1e-12)
+        keep = top_idx[vals[top_idx] >= thr]
+        if keep.size == 0:
+            keep = np.array([int(np.argmax(vals))])
+        for loc in keep:
+            candidate_src.append(si)
+            candidate_tgt.append(int(cols[loc]))
+            candidate_mass.append(float(vals[loc]))
+
+    if len(candidate_mass) > n_arrows:
+        order = np.argsort(candidate_mass)[-n_arrows:]
+        src_idx = np.asarray(candidate_src, dtype=int)[order]
+        tgt_idx = np.asarray(candidate_tgt, dtype=int)[order]
+    else:
+        src_idx = np.asarray(candidate_src, dtype=int)
+        tgt_idx = np.asarray(candidate_tgt, dtype=int)
+    return src_idx, tgt_idx

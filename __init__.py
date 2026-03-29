@@ -9,5 +9,9 @@ from .coherent import (
     DeformationField,
     RigidTransform,
     coherent_pairwise_align,
+    generalized_procrustes_analysis,
     summarize_alignment_metrics,
+    stack_slices_pairwise,
+    visualize_alignment,
+    visualize_alignment_unbalanced,
 )
